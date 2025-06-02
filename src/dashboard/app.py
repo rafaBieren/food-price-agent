@@ -1,7 +1,15 @@
+"""
+Web dashboard for the supermarket price tracking system.
+
+This module provides a web-based dashboard built with Dash for visualizing
+price comparisons and trends across different supermarkets.
+"""
+
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+from typing import Dict, List, Optional
 
 # Add the project root to the Python path
 project_root = Path(__file__).parent.parent.parent
@@ -15,10 +23,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 
-from config.settings import DATABASE_URL, DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_DEBUG
-from src.database.models import Product, Price, Supermarket
+from config.settings import DATABASE_URL, DASHBOARD_HOST, DASHBOARD_PORT, DASHBOARD_DEBUG, DASHBOARD
+from src.database.models import Product, Price, Supermarket, get_session
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,76 +40,88 @@ Session = sessionmaker(bind=engine)
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 app.title = "Supermarket Price Tracker"
 
-def get_price_data(days=30):
-    """Get price data for the last N days."""
-    session = Session()
-    try:
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
+def get_price_data(session: Session, days: int = 30) -> pd.DataFrame:
+    """
+    Retrieve price data from the database.
+    
+    Args:
+        session: Database session
+        days: Number of days of historical data to retrieve
         
-        # Query recent prices with product and supermarket information
-        prices = session.query(
-            Price.price,
-            Price.collected_at,
-            Product.name.label('product_name'),
-            Product.size,
-            Product.unit,
-            Supermarket.name.label('supermarket_name')
-        ).join(
-            Product
-        ).join(
-            Supermarket
-        ).filter(
-            Price.collected_at >= cutoff_date
-        ).all()
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(prices)
-        return df
-    finally:
-        session.close()
+    Returns:
+        pd.DataFrame: DataFrame containing price data
+    """
+    start_date = datetime.utcnow() - timedelta(days=days)
+    
+    query = session.query(
+        Price, Product, Supermarket
+    ).join(
+        Product, Price.product_id == Product.id
+    ).join(
+        Supermarket, Price.supermarket_id == Supermarket.id
+    ).filter(
+        Price.collected_at >= start_date
+    )
+    
+    data = []
+    for price, product, supermarket in query:
+        data.append({
+            'date': price.collected_at,
+            'product_name': product.name,
+            'product_size': f"{product.size} {product.unit}",
+            'supermarket': supermarket.name,
+            'price': price.price,
+            'original_price': price.original_price,
+            'discount_price': price.discount_price
+        })
+    
+    return pd.DataFrame(data)
 
-def get_product_list():
-    """Get list of unique products."""
-    session = Session()
-    try:
-        products = session.query(Product.name).distinct().all()
-        return [{'label': p[0], 'value': p[0]} for p in products]
-    finally:
-        session.close()
+def get_products(session: Session) -> List[Dict]:
+    """
+    Get list of unique products from the database.
+    
+    Args:
+        session: Database session
+        
+    Returns:
+        List[Dict]: List of product dictionaries
+    """
+    products = session.query(Product).all()
+    return [{'label': f"{p.name} ({p.size} {p.unit})", 'value': p.id} for p in products]
 
 # Layout
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col([
-            html.H1("Supermarket Price Tracker", className="text-center my-4"),
-            html.P("Compare prices across different supermarket chains", className="text-center")
+            html.H1("Supermarket Price Comparison Dashboard", className="text-center my-4"),
+            html.P("Compare prices across different supermarkets and track price trends over time.",
+                  className="text-center mb-4")
         ])
     ]),
     
     dbc.Row([
         dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H4("Price Comparison", className="card-title"),
-                    dcc.Dropdown(
-                        id='product-dropdown',
-                        options=get_product_list(),
-                        placeholder="Select a product"
-                    ),
-                    dcc.Graph(id='price-comparison-graph')
-                ])
-            ])
+            html.H4("Select Product", className="mb-3"),
+            dcc.Dropdown(
+                id='product-dropdown',
+                options=get_products(get_session()),
+                placeholder="Select a product..."
+            )
+        ], width=6)
+    ], className="mb-4"),
+    
+    dbc.Row([
+        dbc.Col([
+            html.H4("Current Price Comparison", className="mb-3"),
+            dcc.Graph(id='price-comparison-graph')
         ], width=12)
     ], className="mb-4"),
     
     dbc.Row([
         dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H4("Price Trends", className="card-title"),
-                    dcc.Graph(id='price-trends-graph')
-                ])
-            ])
+            html.H4("Price Trends", className="mb-3"),
+            dcc.Graph(id='price-trends-graph')
         ], width=12)
     ])
 ], fluid=True)
@@ -111,40 +131,54 @@ app.layout = dbc.Container([
      Output('price-trends-graph', 'figure')],
     [Input('product-dropdown', 'value')]
 )
-def update_graphs(selected_product):
-    if not selected_product:
-        return {}, {}
+def update_graphs(selected_product_id: Optional[int]):
+    """
+    Update the dashboard graphs based on selected product.
     
-    df = get_price_data()
-    df = df[df['product_name'] == selected_product]
+    Args:
+        selected_product_id: ID of the selected product
+        
+    Returns:
+        Tuple[go.Figure, go.Figure]: Price comparison and trends figures
+    """
+    if not selected_product_id:
+        return go.Figure(), go.Figure()
     
-    # Price comparison graph
-    comparison_fig = px.box(
-        df,
-        x='supermarket_name',
+    session = get_session()
+    df = get_price_data(session)
+    
+    # Filter data for selected product
+    product_df = df[df['product_id'] == selected_product_id]
+    
+    # Create price comparison bar chart
+    comparison_fig = px.bar(
+        product_df.groupby('supermarket')['price'].last().reset_index(),
+        x='supermarket',
         y='price',
-        title=f'Price Comparison for {selected_product}',
-        labels={'supermarket_name': 'Supermarket', 'price': 'Price (₪)'}
+        title='Current Price Comparison',
+        labels={'price': 'Price (₪)', 'supermarket': 'Supermarket'}
     )
     
-    # Price trends graph
+    # Create price trends line chart
     trends_fig = px.line(
-        df,
-        x='collected_at',
+        product_df,
+        x='date',
         y='price',
-        color='supermarket_name',
-        title=f'Price Trends for {selected_product}',
-        labels={'collected_at': 'Date', 'price': 'Price (₪)', 'supermarket_name': 'Supermarket'}
+        color='supermarket',
+        title='Price Trends Over Time',
+        labels={'price': 'Price (₪)', 'date': 'Date', 'supermarket': 'Supermarket'}
     )
     
     return comparison_fig, trends_fig
 
 def run_server():
-    """Run the Dash server."""
+    """
+    Run the Dash web server.
+    """
     app.run_server(
-        host=DASHBOARD_HOST,
-        port=DASHBOARD_PORT,
-        debug=DASHBOARD_DEBUG
+        host=DASHBOARD['host'],
+        port=DASHBOARD['port'],
+        debug=DASHBOARD['debug']
     )
 
 if __name__ == '__main__':
